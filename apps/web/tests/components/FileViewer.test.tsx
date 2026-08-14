@@ -2550,7 +2550,7 @@ describe('FileViewer SVG artifacts', () => {
     expect(screen.getByRole('menuitem', { name: /export as image/i })).toBeTruthy();
   });
 
-  it('restores captured URL preview state once after the matching prewarmed document is ready', async () => {
+  it('restores captured URL preview state once after the matching prewarmed document is verified', async () => {
     const file = baseFile({
       name: 'page.html',
       path: 'page.html',
@@ -2597,13 +2597,24 @@ describe('FileViewer SVG artifacts', () => {
     const srcDocFrame = container.querySelector('iframe[data-od-render-mode="srcdoc"]') as HTMLIFrameElement | null;
     expect(srcDocFrame?.getAttribute('data-od-active')).toBe('false');
     expect(srcDocFrame?.srcdoc).toContain('__odArtifactBootCount');
+    const srcDocPostSpy = vi.spyOn(srcDocFrame!.contentWindow!, 'postMessage');
     fireEvent.load(srcDocFrame!);
 
     const readyGeneration = srcDocFrame?.srcdoc.match(
       /data-od-srcdoc-transport-activation>[\s\S]*?var generation = "([^"]+)";/,
     )?.[1];
     expect(readyGeneration).toBeTruthy();
+    const readinessProbe = srcDocPostSpy.mock.calls.find(
+      ([message]) => (
+        (message as { type?: unknown }).type === 'od:srcdoc-transport-ready-probe'
+        && (message as { generation?: unknown }).generation === readyGeneration
+      ),
+    )?.[0] as { generation?: string; probeId?: string } | undefined;
+    expect(readinessProbe?.generation).toBe(readyGeneration);
+    expect(readinessProbe?.probeId).toBeTruthy();
     act(() => {
+      // The eager head acknowledgement is provisional and must not consume
+      // URL runtime state before the challenged witness arrives.
       window.dispatchEvent(new MessageEvent('message', {
         source: srcDocFrame?.contentWindow,
         data: {
@@ -2623,7 +2634,6 @@ describe('FileViewer SVG artifacts', () => {
     });
 
     const urlPostSpy = vi.spyOn(urlFrame.contentWindow!, 'postMessage');
-    const srcDocPostSpy = vi.spyOn(srcDocFrame!.contentWindow!, 'postMessage');
     fireEvent.click(screen.getByTestId('manual-edit-mode-toggle'));
 
     const captureRequest = await waitFor(() => {
@@ -2691,6 +2701,24 @@ describe('FileViewer SVG artifacts', () => {
     expect(srcDocFrameAfter).toBe(srcDocFrame);
     expect(srcDocFrameAfter?.srcdoc).toContain('__odArtifactBootCount');
     expect(srcDocFrameAfter?.srcdoc).toContain('data-od-edit-bridge');
+
+    const restoreCalls = () => srcDocPostSpy.mock.calls.filter(([message]) => (
+      typeof message === 'object'
+      && message !== null
+      && (message as { type?: unknown }).type === 'od:preview-runtime-state-restore'
+    ));
+    expect(restoreCalls()).toHaveLength(0);
+
+    act(() => {
+      window.dispatchEvent(new MessageEvent('message', {
+        source: srcDocFrameAfter?.contentWindow,
+        data: {
+          type: 'od:srcdoc-transport-activated',
+          generation: readinessProbe!.generation,
+          probeId: readinessProbe!.probeId,
+        },
+      }));
+    });
     await waitFor(() => {
       expect(srcDocPostSpy).toHaveBeenCalledWith(
         { type: 'od:preview-runtime-state-restore', state: capturedState },
@@ -2698,11 +2726,6 @@ describe('FileViewer SVG artifacts', () => {
       );
     });
 
-    const restoreCalls = () => srcDocPostSpy.mock.calls.filter(([message]) => (
-      typeof message === 'object'
-      && message !== null
-      && (message as { type?: unknown }).type === 'od:preview-runtime-state-restore'
-    ));
     expect(restoreCalls()).toHaveLength(1);
 
     srcDocPostSpy.mockClear();
@@ -7296,6 +7319,91 @@ describe('FileViewer tweaks toolbar', () => {
     ))).toHaveLength(1);
   });
 
+  it('recovers when an asynchronously scoped base replaces an already verified srcDoc navigation', async () => {
+    vi.useFakeTimers();
+    const context = teamWorkspaceContext();
+    const previewBaseResponse = deferredResponse();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).includes('/api/projects/project-1/preview-url')) {
+        return previewBaseResponse.promise;
+      }
+      return new Response(JSON.stringify({ deployments: [] }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    try {
+      renderWithProjectWorkspace(
+        <FileViewer
+          projectId="project-1"
+          projectKind="prototype"
+          file={htmlPreviewFile({ name: 'brand.html', path: 'brand.html' })}
+          liveHtml={'<!doctype html><html><body><script>location.reload()</script></body></html>'}
+        />,
+        context,
+      );
+
+      const initialFrame = screen.getByTestId('artifact-preview-frame') as HTMLIFrameElement;
+      const initialGeneration = initialFrame.srcdoc.match(
+        /data-od-srcdoc-transport-activation>[\s\S]*?var generation = "([^"]+)";/,
+      )?.[1];
+      expect(initialGeneration).toBeTruthy();
+
+      const postMessage = vi.spyOn(initialFrame.contentWindow!, 'postMessage');
+      fireEvent.load(initialFrame);
+      const initialProbe = postMessage.mock.calls.find(
+        ([message]) => (message as { type?: unknown }).type === 'od:srcdoc-transport-ready-probe',
+      )?.[0] as { probeId?: string } | undefined;
+      expect(initialProbe?.probeId).toBeTruthy();
+      act(() => {
+        window.dispatchEvent(new MessageEvent('message', {
+          source: initialFrame.contentWindow,
+          data: {
+            type: 'od:srcdoc-transport-activated',
+            generation: initialGeneration,
+            probeId: initialProbe!.probeId,
+          },
+        }));
+      });
+
+      await act(async () => {
+        previewBaseResponse.resolve(new Response(JSON.stringify({
+          url: '/api/projects/project-1/preview/scope-1/brand.html',
+          file: 'brand.html',
+          csp: "default-src 'none'",
+          iframeSandbox: 'allow-scripts allow-forms',
+          opaqueOrigin: true,
+        }), { status: 200 }));
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      const scopedFrame = screen.getByTestId('artifact-preview-frame') as HTMLIFrameElement;
+      expect(scopedFrame).toBe(initialFrame);
+      expect(scopedFrame.srcdoc).toContain(
+        '<base href="/api/projects/project-1/preview/scope-1/">',
+      );
+      const scopedGeneration = scopedFrame.srcdoc.match(
+        /data-od-srcdoc-transport-activation>[\s\S]*?var generation = "([^"]+)";/,
+      )?.[1];
+      expect(scopedGeneration).toBeTruthy();
+      expect(scopedGeneration).not.toBe(initialGeneration);
+
+      act(() => {
+        // Model Electron's aborted second about:srcdoc navigation: the new
+        // document sends neither load nor activation, so recovery must not
+        // trust the verified witness from the pre-base document.
+        vi.runAllTimers();
+      });
+
+      const recoveredFrame = screen.getByTestId('artifact-preview-frame') as HTMLIFrameElement;
+      expect(recoveredFrame).not.toBe(scopedFrame);
+      expect(recoveredFrame.srcdoc).toContain('data-od-lazy-srcdoc-transport');
+    } finally {
+      previewBaseResponse.resolve(new Response('', { status: 404 }));
+      vi.useRealTimers();
+    }
+  });
+
   it('preserves an authored base without minting a project-scoped preview capability', async () => {
     const context = teamWorkspaceContext();
     const authoredBase = '<base href="https://cdn.example/assets/">';
@@ -7653,6 +7761,7 @@ describe('FileViewer tweaks toolbar', () => {
     // happens only after the user enters an interactive mode.
     const initialSrcDocFrame = container.querySelector('iframe[data-od-render-mode="srcdoc"]') as HTMLIFrameElement;
     expect(initialSrcDocFrame.srcdoc).toContain('data-od-lazy-srcdoc-transport');
+    const postMessage = vi.spyOn(initialSrcDocFrame.contentWindow!, 'postMessage');
 
     // Materialize once via Draw. The manual-edit bridge must already be present
     // even though Edit is NOT active — it boots dormant and only acts on the
@@ -7664,6 +7773,33 @@ describe('FileViewer tweaks toolbar', () => {
       expect(f.srcdoc).toContain('Stable doc');
       expect(f.srcdoc).toContain('data-od-edit-bridge');
       return f.srcdoc;
+    });
+    const materializedFrame = container.querySelector('iframe[data-od-render-mode="srcdoc"]') as HTMLIFrameElement;
+    const materializedGeneration = materializedFrame.srcdoc.match(
+      /data-od-srcdoc-transport-activation>[\s\S]*?var generation = "([^"]+)";/,
+    )?.[1];
+    expect(materializedGeneration).toBeTruthy();
+    fireEvent.load(materializedFrame);
+    const probe = await waitFor(() => {
+      const value = postMessage.mock.calls.find(
+        ([message]) => (
+          (message as { type?: unknown }).type === 'od:srcdoc-transport-ready-probe'
+          && (message as { generation?: unknown }).generation === materializedGeneration
+        ),
+      )?.[0] as { generation?: string; probeId?: string } | undefined;
+      expect(value?.generation).toBeTruthy();
+      expect(value?.probeId).toBeTruthy();
+      return value!;
+    });
+    act(() => {
+      window.dispatchEvent(new MessageEvent('message', {
+        source: materializedFrame.contentWindow,
+        data: {
+          type: 'od:srcdoc-transport-activated',
+          generation: probe.generation,
+          probeId: probe.probeId,
+        },
+      }));
     });
 
     // Leave Draw and enter Edit. Because the edit bridge was already in the

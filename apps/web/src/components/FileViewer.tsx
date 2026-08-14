@@ -618,6 +618,7 @@ const htmlPreviewZoomState = new Map<string, { zoom: number; zoomMode: 'auto' | 
 const MAX_CACHED_PREVIEW_CONTENT_WIDTHS = 128;
 const PREVIEW_CONTENT_WIDTH_CACHE_VERSION = 2;
 const SRC_DOC_ACTIVATION_RECOVERY_TIMEOUT_MS = 1500;
+const SRC_DOC_READY_PROBE_TIMEOUT_MS = 1500;
 let previewContentMeasurementDocumentEpochSequence = 0;
 let previewContentMeasurementHostInstanceSequence = 0;
 let previewTransportGenerationSequence = 0;
@@ -10136,6 +10137,8 @@ function HtmlViewer({
     workspaceContext,
   ]);
 
+  const srcDocBaseHref = effectiveScopedSrcDocPreviewBase
+    ?? projectRawUrl(projectId, baseDirFor(file.name), workspaceContext);
   const srcDocTransportGeneration = useMemo(
     () => nextPreviewTransportGeneration(),
     [
@@ -10146,10 +10149,9 @@ function HtmlViewer({
       reloadKey,
       transportPreviewMeasurementDocumentEpoch,
       workspaceContext,
+      srcDocBaseHref,
     ],
   );
-  const srcDocBaseHref = effectiveScopedSrcDocPreviewBase
-    ?? projectRawUrl(projectId, baseDirFor(file.name), workspaceContext);
   const srcDoc = useMemo(
     () => (previewSource ? buildSrcdoc(previewSource, {
       deck: effectiveDeck,
@@ -10194,15 +10196,29 @@ function HtmlViewer({
     frame: HTMLIFrameElement;
     generation: string;
   } | null>(null);
+  // Eager readiness keeps the existing bridge features responsive. Navigation
+  // recovery uses the separately challenged witness below because Chromium can
+  // abort about:srcdoc after the head bridge has already announced itself.
+  const verifiedSrcDocTransportRef = useRef<{
+    frame: HTMLIFrameElement;
+    generation: string;
+  } | null>(null);
+  const srcDocTransportProbeSequenceRef = useRef(0);
+  const pendingSrcDocTransportProbeRef = useRef<{
+    frame: HTMLIFrameElement;
+    generation: string;
+    probeId: string;
+    recoverOnFailure: boolean;
+  } | null>(null);
   const replayPreviewBridgeModes = useCallback((target: HTMLIFrameElement | null) => {
     if (!workspaceActive) return;
     const win = target?.contentWindow;
     if (!win) return;
-    const ready = readySrcDocTransportRef.current;
+    const verified = verifiedSrcDocTransportRef.current;
     if (
       target === srcDocPreviewIframeRef.current
-      && ready?.frame === target
-      && ready.generation === expectedSrcDocTransportGenerationRef.current
+      && verified?.frame === target
+      && verified.generation === expectedSrcDocTransportGenerationRef.current
     ) {
       postAndConsumePreviewRuntimeState(target);
     }
@@ -10302,16 +10318,71 @@ function HtmlViewer({
       return;
     }
     const frame = srcDocPreviewIframeRef.current;
-    const ready = readySrcDocTransportRef.current;
-    if (frame && ready?.frame === frame && ready.generation === generation) return;
+    const verified = verifiedSrcDocTransportRef.current;
+    if (frame && verified?.frame === frame && verified.generation === generation) return;
     if (srcDocRecoveryAttemptedGenerationRef.current === generation) return;
     srcDocRecoveryAttemptedGenerationRef.current = generation;
+    pendingSrcDocTransportProbeRef.current = null;
+    verifiedSrcDocTransportRef.current = null;
     readySrcDocTransportRef.current = null;
     activatedSrcDocTransportHtmlRef.current = null;
     setSrcDocShellReady(false);
     setSrcDocRecoveryGeneration(generation);
     setSrcDocTransportResetKey((key) => key + 1);
   }, []);
+  const probeSrcDocTransport = useCallback((
+    generation: string,
+    recoverOnFailure: boolean,
+  ) => {
+    if (
+      !workspaceActiveRef.current
+      || expectedSrcDocTransportGenerationRef.current !== generation
+    ) {
+      return;
+    }
+    const frame = srcDocPreviewIframeRef.current;
+    if (!frame) return;
+    const pending = pendingSrcDocTransportProbeRef.current;
+    const pendingRecoveryProbeMatches = (
+      pending?.frame === frame
+      && pending.generation === generation
+      && pending.recoverOnFailure
+    );
+    // Recovery probes can be shared by the timer and onLoad paths. A passive
+    // prewarm probe may target the lazy shell, so the real srcDoc must replace it.
+    if (pendingRecoveryProbeMatches) return;
+    srcDocTransportProbeSequenceRef.current += 1;
+    const probeId = `${generation}:probe-${srcDocTransportProbeSequenceRef.current}`;
+    pendingSrcDocTransportProbeRef.current = {
+      frame,
+      generation,
+      probeId,
+      recoverOnFailure,
+    };
+    // An eager acknowledgement from the injected head bridge is provisional:
+    // Chromium can still abort the about:srcdoc navigation after it was sent.
+    // Only this exact challenge response proves the current browsing context is
+    // alive after the navigation had a chance to commit.
+    verifiedSrcDocTransportRef.current = null;
+    frame.contentWindow?.postMessage({
+      type: 'od:srcdoc-transport-ready-probe',
+      generation,
+      probeId,
+    }, '*');
+    window.setTimeout(() => {
+      const pending = pendingSrcDocTransportProbeRef.current;
+      if (
+        !pending
+        || pending.frame !== frame
+        || pending.generation !== generation
+        || pending.probeId !== probeId
+      ) {
+        return;
+      }
+      pendingSrcDocTransportProbeRef.current = null;
+      if (pending.recoverOnFailure) recoverUnacknowledgedSrcDocTransport(generation);
+    }, SRC_DOC_READY_PROBE_TIMEOUT_MS);
+  }, [recoverUnacknowledgedSrcDocTransport]);
   // Sticky once the srcDoc iframe has materialized the real artifact for the
   // first time (i.e. the first entry into Mark/Edit/Comment/Inspect). Until
   // then the srcDoc iframe stays on the lazy shell — so passive preview never
@@ -10366,7 +10437,12 @@ function HtmlViewer({
     function onMessage(ev: MessageEvent) {
       const frame = srcDocPreviewIframeRef.current;
       if (ev.source !== frame?.contentWindow) return;
-      const data = ev.data as { type?: unknown; generation?: unknown } | null;
+      const data = ev.data as {
+        type?: unknown;
+        generation?: unknown;
+        probeId?: unknown;
+      } | null;
+      const pending = pendingSrcDocTransportProbeRef.current;
       if (
         data?.type !== 'od:srcdoc-transport-activated'
         || typeof data.generation !== 'string'
@@ -10375,32 +10451,45 @@ function HtmlViewer({
         return;
       }
       readySrcDocTransportRef.current = { frame, generation: data.generation };
+      if (
+        typeof data.probeId === 'string'
+        && pending
+        && pending.frame === frame
+        && pending.generation === data.generation
+        && pending.probeId === data.probeId
+      ) {
+        pendingSrcDocTransportProbeRef.current = null;
+        verifiedSrcDocTransportRef.current = { frame, generation: data.generation };
+      }
       if (frame === iframeRef.current) replayPreviewBridgeModes(frame);
     }
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
   }, [replayPreviewBridgeModes, workspaceActive]);
   // React can commit a fresh `srcdoc` attribute while Chromium aborts the
-  // corresponding about:srcdoc navigation. The host then believes the latest
-  // revision is applied, but the iframe stays on its old/empty document until
-  // Code -> Preview happens to remount it. Every real srcDoc carries an exact
-  // generation ACK; if the active frame never acknowledges that generation,
-  // retry through the small lazy shell automatically; Chromium can commit that
-  // shell even when it aborts a large direct srcDoc navigation, after which the
-  // existing ready handshake safely document.write's the latest HTML. One
-  // fallback per generation avoids a loop when an authored document is
-  // fundamentally unable to execute scripts.
+  // corresponding about:srcdoc navigation. The injected head bridge may run
+  // and announce eagerly before that abort, so a plain generation ACK is not a
+  // committed-document witness. Challenge the current browsing context after
+  // the navigation had time to settle and require the exact probe token back;
+  // otherwise retry through the small lazy shell automatically. Chromium can
+  // commit that shell even when it aborts a large direct srcDoc navigation,
+  // after which the existing ready handshake safely document.write's the
+  // latest HTML. One fallback per generation avoids a loop when an authored
+  // document is fundamentally unable to execute scripts.
   useEffect(() => {
     if (!workspaceActive || mode !== 'preview' || useUrlLoadPreview || !srcDoc) return;
     const generation = srcDocTransportGeneration;
     if (srcDocRecoveryAttemptedGenerationRef.current === generation) return;
     const timeout = window.setTimeout(() => {
-      recoverUnacknowledgedSrcDocTransport(generation);
+      const frame = srcDocPreviewIframeRef.current;
+      const verified = verifiedSrcDocTransportRef.current;
+      if (frame && verified?.frame === frame && verified.generation === generation) return;
+      probeSrcDocTransport(generation, true);
     }, SRC_DOC_ACTIVATION_RECOVERY_TIMEOUT_MS);
     return () => window.clearTimeout(timeout);
   }, [
     mode,
-    recoverUnacknowledgedSrcDocTransport,
+    probeSrcDocTransport,
     srcDoc,
     srcDocTransportGeneration,
     useUrlLoadPreview,
@@ -10591,21 +10680,7 @@ function HtmlViewer({
   function verifyLoadedSrcDocTransport(target: HTMLIFrameElement | null) {
     if (!target || target !== srcDocPreviewIframeRef.current) return;
     const generation = srcDocTransportGeneration;
-    if (!useUrlLoadPreview && srcDoc) {
-      // `load` may belong to a provisional about:blank/about:srcdoc document.
-      // Drop any earlier ACK and require the document that actually completed
-      // this load to answer the generation probe. This closes the window where
-      // a provisional document announces from its head and is then aborted.
-      readySrcDocTransportRef.current = null;
-    }
-    target.contentWindow?.postMessage({
-      type: 'od:srcdoc-transport-ready-probe',
-      generation,
-    }, '*');
-    if (useUrlLoadPreview || !srcDoc) return;
-    window.setTimeout(() => {
-      recoverUnacknowledgedSrcDocTransport(generation);
-    }, SRC_DOC_ACTIVATION_RECOVERY_TIMEOUT_MS);
+    probeSrcDocTransport(generation, !useUrlLoadPreview && Boolean(srcDoc));
   }
   useEffect(() => {
     if (useUrlLoadPreview) {
@@ -10879,11 +10954,11 @@ function HtmlViewer({
     const target = iframeRef.current;
     const win = target?.contentWindow;
     if (!win) return;
-    const ready = readySrcDocTransportRef.current;
+    const verified = verifiedSrcDocTransportRef.current;
     if (
       target === srcDocPreviewIframeRef.current
-      && ready?.frame === target
-      && ready.generation === expectedSrcDocTransportGenerationRef.current
+      && verified?.frame === target
+      && verified.generation === expectedSrcDocTransportGenerationRef.current
     ) {
       postAndConsumePreviewRuntimeState(target);
     }
