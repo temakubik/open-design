@@ -1,0 +1,40 @@
+{
+  "candidateId": "dd1fa17a-4cf9-4e3c-9c59-49372e3ccffd",
+  "projectId": "brand-product-42c67b",
+  "runId": "fe383085-6dfc-4c27-bc2f-7c0c9e229e94",
+  "conversationId": "d6f7492d-bfdc-4a4f-b232-c00cfaf74160",
+  "provenance": {
+    "summary": "Detected from README.md, SKILL.md, ui_kits/app/README.md, context/source-context.md after a successful run.",
+    "detectedAt": 1786693588226
+  },
+  "sourceRefs": [
+    {
+      "kind": "file",
+      "value": "README.md",
+      "label": "README.md",
+      "size": 6705,
+      "copied": true
+    },
+    {
+      "kind": "file",
+      "value": "SKILL.md",
+      "label": "SKILL.md",
+      "size": 3822,
+      "copied": true
+    },
+    {
+      "kind": "file",
+      "value": "ui_kits/app/README.md",
+      "label": "ui_kits/app/README.md",
+      "size": 3021,
+      "copied": true
+    },
+    {
+      "kind": "file",
+      "value": "context/source-context.md",
+      "label": "context/source-context.md",
+      "size": 8857,
+      "copied": true
+    }
+  ]
+}
